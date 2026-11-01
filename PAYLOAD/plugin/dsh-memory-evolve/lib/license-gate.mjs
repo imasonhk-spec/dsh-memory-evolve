@@ -1,5 +1,5 @@
 // license-gate.mjs —— DSH 插件授权运行时（vendored，随插件分发）
-// v1.1 · 2026-10-26
+// v1.2 · 2026-10-29  ★ SILENT MODE（装上即用）★
 //
 // 来源：@local/dsh-workbench 线上部署版（index.js，minified）的 Ed25519 票池门禁，
 //       抽成单文件 + 补齐「独立安装 / 组合使用」双形态 + O2 离线激活包导入。
@@ -11,7 +11,29 @@
 //   L-C 隔离：authorization subject 共享，但账本（pool/seq/心跳）按插件分片，
 //             每个插件一个状态文件，绝不共写。
 //
-// 与线上 workbench 版的差异（共 8 处）：
+// ============================ v1.2 变更（SILENT） ============================
+// S-1 【核心】静默放行：客户装完即用，永不弹激活界面。
+//     旧行为（v1.1）取不到证/连不上服/票尽 → close(reason) → usable=false → 前端锁屏。
+//     新行为：上述全部视为「软故障」，直接放行；后台继续自愈（注册/补票/续期）。
+//     唯一仍拒绝的状态：授权被**显式吊销**（服务端下发 status=disabled）。
+//     —— 也就是说：能收钱、能停用、能统计，但绝不因为网络或票券把客户挡在门外。
+//
+// S-2 票券彻底旁路：allow() 不再依赖 pool。v1.1 里 ticket_free 要等服务端下发才生效，
+//     首启若连不上服就永远停在「要票」分支 → 100 次后永久锁死。v1.2 默认 silent=true，
+//     不等服务端，本地直接按「只校验有效期」跑。
+//
+// S-3 状态自描述：state() 增加 silent / lockable，让前端能区分「静默模式」与「严格模式」。
+//
+// S-4 Windows 机器码修复：v1.1 只读 /etc/machine-id，Windows 上全部读不到 →
+//     退化成 hostname+CPU型号+用户名，同型号笔记本+同名用户会算出同一个码（实测可复现）。
+//     v1.2 增加 Windows 注册表 MachineGuid / 卷序列号 / macOS IOPlatformUUID 探测。
+//     ⚠️ 该变化会改变**已发证的 Windows 机器码**；为保证老机器不失效，仅在
+//        「原有 fallback 计算不出唯一标识」或首次激活时生效，见 hwid() 注释。
+//
+// S-5 时钟回拨不再永久锁：clock_tamper 降级为软故障（放行 + 告警），避免客户
+//     主板电池没电/时区错乱导致插件「莫名其妙打不开」。
+//
+// 与线上 workbench 版的差异（共 8 处，v1.1 继承）：
 //   1) covers(lic) 支持 plugin_id==='*'（套件证）
 //   2) 双状态文件（own / suite），按插件分片
 //   3) lease.json 共享租约缓存
@@ -25,6 +47,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import { execFileSync } from 'node:child_process';
 
 const PUB_PEM = `-----BEGIN PUBLIC KEY-----
 MCowBQYDK2VwAyEAgbkbnNduRwrgAtI9lpc3OLfxzJOrMoZMEtw8RHg+4gE=
@@ -38,6 +61,19 @@ const TICKET_FIELDS = ['v', 'lid', 'pid', 'cid', 'hwid', 'seq', 'iat', 'exp'];
 const SERVER = (process.env.DSH_LICENSE_SERVER || 'https://sync.ilica.cn').replace(/\/+$/, '');
 const CLOCK_SKEW_MS = 600_000;
 const MAX_PACK_BYTES = 64 * 1024 * 1024;
+/* ★ v1.2c（2026-10-30）：本 SDK 版本号，随 inventory 上报，管理台据此判断该设备能否采到清单。 */
+const AGENT_VER = '1.2c';
+
+/* ★ v1.2 SILENT 总开关。
+   默认 true：客户装完即用，永不弹激活。要恢复 v1.1 的严格门禁（缺证即锁屏），
+   设环境变量 DSH_LICENSE_SILENT=0，或 createGate({silent:false})。 */
+function silentDefault() {
+  try {
+    const v = String(process.env.DSH_LICENSE_SILENT ?? '').trim().toLowerCase();
+    if (v === '0' || v === 'false' || v === 'no' || v === 'off') return false;
+  } catch {}
+  return true;
+}
 
 // ---- canonical JSON：递归按 key 排序（必须与服务端 sign.js 完全一致）----
 function canonical(v) {
@@ -71,6 +107,30 @@ export const verifyTicketBlob = (o) => isTicket(o);
 export const machineHwid = () => hwid();
 
 // ---- 设备身份 ----
+
+/* WB-HWID-WIN (v1.2)：跨平台稳定机器码。
+   旧实现的探测列表全是 Linux 路径，Windows 上必然全部失败 →
+   退化成 `hostname + CPU型号 + 用户名`，同型号笔记本 + 同名用户（现场很常见，
+   比如两台都叫「Administrator」或都用同一镜像装机）会算出**完全相同的机器码**，
+   导致 A 机器的证被 B 机器"继承"、或注册时被判重绑到别人的 client。
+   这里按「稳定 + 唯一 + 不随硬件小改而变」排序，取第一个可用值。 */
+function _exec(cmd, args) {
+  try { return execFileSync(cmd, args, { encoding: 'utf-8', timeout: 4000, windowsHide: true }); } catch { return null; }
+}
+function _winMachineGuid() {
+  const out = _exec('reg', ['query', 'HKLM\\SOFTWARE\\Microsoft\\Cryptography', '/v', 'MachineGuid']);
+  const m = out && out.match(/MachineGuid\s+REG_SZ\s+([0-9a-fA-F-]{32,40})/);
+  if (m && m[1]) return 'winguid:' + m[1].toLowerCase();
+  const vol = _exec('cmd', ['/c', 'vol', 'C:']);
+  const mv = vol && vol.match(/([0-9A-F]{4}-[0-9A-F]{4})/i);
+  if (mv && mv[1]) return 'winvol:' + mv[1].toLowerCase();
+  return null;
+}
+function _macPlatformUuid() {
+  const out = _exec('ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice']);
+  const m = out && out.match(/"IOPlatformUUID"\s*=\s*"([^"]+)"/);
+  return (m && m[1]) ? 'macuuid:' + m[1].toLowerCase() : null;
+}
 function __wbInstHwid(base) {
   /* WB-INST-HWID: 一实例一证 —— 账号实例（DSH_HOME 独立于 ~/.dsh）派生独立设备身份；
      主实例（DSH_HOME == ~/.dsh 或未设置）原样返回，已有证与票池不受影响。 */
@@ -87,14 +147,34 @@ function __wbInstHwid(base) {
   } catch (e) { return base; }
 }
 function hwid() {
+  // ① Linux / NAS：machine-id 系列（最稳，同机多账号共享）
   for (const f of ['/etc/machine-id', '/var/lib/dbus/machine-id', '/sys/class/dmi/id/product_uuid']) {
     try {
       const v = fs.readFileSync(f, 'utf-8').trim();
       if (v && v.length >= 8) return __wbInstHwid(sha256('mid:' + v.toLowerCase()));
     } catch {}
   }
+  // ② Windows：MachineGuid / 卷序列号；macOS：IOPlatformUUID
+  const plat = process.platform;
+  if (plat === 'win32') {
+    const g = _winMachineGuid();
+    if (g) return __wbInstHwid(sha256(g));
+  } else if (plat === 'darwin') {
+    const u = _macPlatformUuid();
+    if (u) return __wbInstHwid(sha256(u));
+  }
+  // ③ 最后兜底：加入网卡 MAC，显著降低「同型号同用户」撞码概率
   const cpus = os.cpus();
-  return __wbInstHwid(sha256('fallback:' + os.hostname() + '|' + (cpus[0] && cpus[0].model || '') + '|' + os.userInfo().username));
+  let mac = '';
+  try {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const ni of list || []) {
+        if (!ni.internal && ni.mac && ni.mac !== '00:00:00:00:00:00') { mac = ni.mac; break; }
+      }
+      if (mac) break;
+    }
+  } catch {}
+  return __wbInstHwid(sha256('fallback:' + os.hostname() + '|' + (cpus[0] && cpus[0].model || '') + '|' + os.userInfo().username + '|' + mac));
 }
 
 function deviceKeys(dir) {
@@ -124,17 +204,24 @@ class Clock {
 }
 
 // ---- 门禁 ----
-export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50, logger = () => {}, server = SERVER, hwid: hwidOverride } = {}) {
+export function createGate({
+  pluginId, dataDir, poolTarget = 500, lowWater = 50,
+  logger = () => {}, server = SERVER, hwid: hwidOverride,
+  // ★ v1.2 SILENT：默认 true = 装上即用。设 DSH_LICENSE_SILENT=0 可退回 v1.1 严格模式。
+  silent = silentDefault(),
+} = {}) {
   const dir = dataDir || path.join(process.env.DSH_HOME || path.join(os.homedir(), '.dsh'), '.cache', '.s');
   const hw = hwidOverride || hwid();        // hwidOverride 仅供单测/排障，生产勿传
   const clock = new Clock(path.join(dir, '.clock'));
-  const gate = { pluginId, hwid: hw, server };
+  const gate = { pluginId, hwid: hw, server, silent };
 
   let key = null, lic = null, pool = [], maxUsedSeq = 0, ackedSeq = 0;
   /* WB-TICKET-FREE: 服务端逐插件下发「不约束票券」时，就不再领票/扣票。
      ticketFree 由任意服务端响应里的 ticket_free 同步；usageCount 是旁路期的调用计数
-     （票不消耗了，但「用了几次」仍要能统计，随心跳 ops_used 上报）。 */
-  let ticketFree = false, usageCount = 0, saveNoMerge = false;
+     （票不消耗了，但「用了几次」仍要能统计，随心跳 ops_used 上报）。
+     ★ v1.2：silent=true 时初始值直接为 true —— 不必等服务端确认。
+       v1.1 的坑：首启连不上服 → 永远收不到 ticket_free → 停在「要票」分支 → 100 次后永久锁死。 */
+  let ticketFree = silent, usageCount = 0, saveNoMerge = false;
 
   /* WB-POOL-CAP: 跟随服务端下发的容量（pool_cap），语义与工作台 _applyServerTime 一致。
      服务端调低容量时这里同步收紧；null/0 表示不限，保持本地默认。 */
@@ -152,9 +239,12 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
 
   /* WB-TICKET-FREE：服务端票券策略同步。
      on  : 进入旁路 —— 清空本地票池（服务端已 acked=issued，这些票作废），之后只看有效期
-     off : 恢复票券 —— 把 refill 节流归零并立刻补票，用户无需重新激活 */
+     off : 恢复票券 —— 把 refill 节流归零并立刻补票，用户无需重新激活
+     ★ v1.2：silent=true 时**忽略**服务端的 off —— 静默模式本地就按“只校验有效期”跑，
+       不接受服务端把本机切回“要票”模式（否则运维在后台一勾选，全部客户立刻停摆）。 */
   function applyTicketFree(d) {
     try {
+      if (silent) { ticketFree = true; return; }
       if (!d || d.ticket_free == null) return;
       const on = !!d.ticket_free;
       if (on && !ticketFree) {
@@ -175,6 +265,8 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
   let reason = null, pending = false, ready = null, hb = null, dev = null;
   // C2：故障分级与自愈状态（permanent 直接拒；hard/soft 退避重试，条件消失自愈）
   let reasonKind = null, attempts = 0, retryAt = 0, recovering = null;
+  // ★ v1.2 静默模式下已忽略的原因（去重打日志，避免刷屏）
+  const silenced = new Set();
   let lastErr = null, lastOkAt = 0, lastRefillAt = 0;
   let kindUsed = 'own';                                     // 'own' | 'suite'
   let stateFile = path.join(dir, stateFileName('own'));
@@ -207,6 +299,15 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
   // 代价：极端掉电最多丢最近 PERSIST_MIN_MS 内消耗的票（票是"燃料"不是计费单位，
   //       且丢的票只是可再用一次，不影响授权边界），因此可接受。
   const PERSIST_MIN_MS = Number(process.env.DSH_LICENSE_PERSIST_MS || 1500);
+  /* ★ v1.2c STATE-SYNC：state() 主动同步的节流窗口。
+     管理台点「禁止」后必须在**秒级**生效 —— 这是「可控制禁止」这条需求的底线。
+     guard 每 2s 读一次 state，这里给 5s 节流：
+       · 最坏 5s + 2s 轮询 ≈ 7s 生效，平均 3s；
+       · 一台机 8 个插件 ≈ 每 5s 8 次 refresh，但被 hbDue 的 55s 合并后
+         实际服务端压力 ≈ advertise 的 1/7，且只在 state 被读时才发（空闲不发）。
+     设 0 可关闭主动同步（退回只靠 60s 心跳）；设大值（如 60000）可省流量。 */
+  const STATE_SYNC_MS = Number(process.env.DSH_LICENSE_STATE_SYNC_MS || 5_000);
+  let lastStateSync = 0, stateSyncing = false;
   let dirty = false, lastSave = 0, saveTimer = null;
   function save() {
     try {
@@ -279,9 +380,22 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
   // C2 分级：permanent 直接拒且不自愈；hard 拒但退避重试；soft 有本地证时不阻断、无证时退避重试
   const PERMA_REASONS = new Set(['revoked', 'unknown_plugin', 'plugin_mismatch', 'expired', 'not_active']);
   const HARD_REASONS = new Set(['hwid_mismatch', 'device_mismatch', 'clock_tamper']);
+  /* ★ v1.2 SILENT：静默模式下**只**对这几种状态真正关门。
+     判据是"这台机器被服务商主动停用"，而不是"网络不好/票用完/时间不准"。
+     其余一切原因（含 offline_no_license / no_ticket / unavailable / register_failed /
+     rate_limited / clock_tamper / hwid_mismatch）都只记录告警，继续放行。 */
+  const SILENT_BLOCKERS = new Set(['revoked']);
   const close = (r) => {
     if (reason || r === 'no_ticket') return;
     if (lic && NET_REASONS.has(r)) { logger('net issue ignored (local license present)', r); return; }
+    // ★ 静默模式：非「显式吊销」一律不阻断，只留痕 + 让后台自愈
+    if (silent && !SILENT_BLOCKERS.has(r)) {
+      if (!silenced.has(r)) { silenced.add(r); logger('silent: not blocking on', r); }
+      reasonKind = 'soft';
+      attempts += 1;
+      if (!retryAt) retryAt = Date.now() + backoffMs(attempts);
+      return;
+    }
     reason = r;
     reasonKind = PERMA_REASONS.has(r) ? 'permanent' : (HARD_REASONS.has(r) ? 'hard' : 'soft');
     logger('gate closed', r, reasonKind);
@@ -470,6 +584,10 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
       });
       if (data && data.server_time) clock.calibrate(data.server_time);
       applyCap(data); applyTicketFree(data);
+      /* ★ v1.2c DEVICE-KILL：设备级禁止的显式下发。
+         与 lic.status 分开判：管理台「禁止设备」停的是整机，
+         而 lic.status 是逐插件的。两者任一为 disabled 都要关门。 */
+      if (data && data.device_status === 'disabled') { close('revoked'); return false; }
       if (data && data.status === 'disabled') { close('revoked'); return false; }
       if (stale(g)) return false;                             // 期间导入过离线包，让位
       if (data && data.license) { if (!isLicense(data.license)) { close('bad_signature'); return false; } lic = data.license; }
@@ -481,7 +599,19 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
       if (ackedOk) usageCount = 0;
       save();
       lastOkAt = Date.now();
-      if (reason && reasonKind === 'soft') markOk('sync');
+      /* ★ v1.2c SELF-HEAL：原来只在 reasonKind==='soft' 时 markOk ——
+         而 revoked/not_active 被归为 permanent，一旦被管理员禁止就**再也自愈不了**，
+         解禁后只能人工删状态文件。但吊销是「可变状态」而非「不可变错误」：
+         服务端这次明确回了 ok/active（说明它认为这台设备/这张证正常），
+         就必须把 revoked/not_active 清掉。
+         真正不可变的只有 unknown_plugin / plugin_mismatch / expired / bad_signature
+         这类「证本身不对」的情形，以及当前仍被判为 disabled 的分支（上面已 return）。 */
+      const SERVER_OK = !!(data && (data.ok === true || data.status === 'active'));
+      if (reason && (reasonKind === 'soft' || (SERVER_OK && (reason === 'revoked' || reason === 'not_active')))) {
+        markOk('sync');
+      }
+      /* v1.2c：心跳成功后顺带维护清单（内部 10 分钟节流，首次会在首个心跳内上报） */
+      reportInventory().catch(() => {});
       /* WB-POOL-ALIGN: 持有量低于目标时后台补满（1 小时内最多一次，由 lastRefillAt 节流） */
       if (pool.length < poolTarget && Date.now() - lastRefillAt > 3600000) refill().catch(() => {});
       return true;
@@ -503,7 +633,15 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
   function heartbeat() {
     if (hb) return;
     hb = setInterval(async () => {
-      if (reason && reasonKind !== 'permanent') { try { await recover(); } catch {} }
+      /* ★ v1.2c SELF-HEAL-REVOKED：permanent 语义是「不重试」，但吊销/停用是**可变状态** ——
+         管理员在管理台点「启用」后设备必须能自己回来。v1.2b 把 revoked 归为 permanent 后
+         心跳不再 recover，等于一旦被禁就永久死锁，只能人工删状态文件。
+         这里对 revoked/not_active 明确走 sync 重新拉状态：仍禁止 → 继续锁；
+         已解禁 → sync 拿回 status=active 并 markOk 自愈。真正不可变的只有 unknown_plugin。 */
+      const revocable = reason === 'revoked' || reason === 'not_active';
+      if (reason && (reasonKind !== 'permanent' || revocable)) {
+        try { await recover(); } catch {}
+      }
       const lid = lic && lic.license_id;
       if (lid && !hbDue(lid)) return;
       try { await init(); await sync(); if (lid) hbMark(lid); } catch {}
@@ -556,7 +694,12 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
     const exp = pack.license.expires_at ? new Date(pack.license.expires_at).getTime() : Infinity;
     if (exp <= clock.now()) return { ok: false, error: 'expired', message: '激活包已过期（' + pack.license.expires_at + '）' };
     const arr = (pack.tickets || {})[pluginId];
-    if (!Array.isArray(arr) || !arr.length) return { ok: false, error: 'no_tickets', message: '激活包里没有本插件的票' };
+    if (!Array.isArray(arr) || !arr.length) {
+      /* ★ v1.2：静默模式下票不是门槛，允许导入“只带证、不带票”的精简包
+         （服务商现在按免票出包，包里 tickets 可能为空数组）。 */
+      if (silent) return { ok: true, count: 0, tickets: [], ticketless: true };
+      return { ok: false, error: 'no_tickets', message: '激活包里没有本插件的票' };
+    }
     if (pack.counts && pack.counts[pluginId] != null && Number(pack.counts[pluginId]) !== arr.length) {
       return { ok: false, error: 'count_mismatch', message: '票数与声明不一致' };
     }
@@ -607,7 +750,8 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
       seen.add(t.seq); dedup.push(t);
     }
     dedup.sort((a, b) => a.seq - b.seq);
-    if (!dedup.length) return { ok: false, error: 'no_usable_ticket', message: '没有可用的票（可能全部已过期或已用）' };
+    // ★ v1.2：静默模式下没有票也允许落盘（票已不是门槛，证才是）
+    if (!dedup.length && !silent) return { ok: false, error: 'no_usable_ticket', message: '没有可用的票（可能全部已过期或已用）' };
 
     kindUsed = kind;
     stateFile = targetFile;
@@ -629,8 +773,27 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
   };
 
   // ---- 对外 API ----
-  gate.allow = async () => {                      // 硬门禁：消耗一张票
+  gate.allow = async () => {                      // 硬门禁
     await init();
+    /* ★ v1.2 SILENT：静默模式下 allow() **永远**先放行（只有显式吊销能挡）。
+       顺序很重要：先判吊销，再无条件 allowed —— 不再经过 pending / reason / 时钟 / 票池。 */
+    if (silent) {
+      /* ★ v1.2c DEVICE-KILL：设备级禁止必须能真正关门。
+         v1.2b 的漏洞：只看 lic.status，不看 reason。设备级禁止走的是
+         「sync 收到 device_status=disabled → close('revoked')」这条路，而 close 只设了
+         reason，lic.status 仍是 active → 静默分支直接放行 → 管理台点了「禁止」客户照用。
+         现在把 reason 为 permanent 的吊销/停用也纳入静默拦截（其余原因一律继续放行，
+         保证「网络不好、票用完、时钟不准」绝不锁客户）。 */
+      if (reason === 'revoked' || reason === 'not_active') return deny(reason);
+      if (lic && lic.status && lic.status !== 'active') {
+        const r = lic.status === 'disabled' ? 'revoked' : 'not_active';
+        reason = r; reasonKind = 'permanent';
+        return deny(r);
+      }
+      usageCount += 1;                       // 仅计数用于统计，不作为门槛
+      reportUsageAsync();                    // v10：异步把用量喂给清单统计（不阻塞请求路径）
+      return { allowed: true, silent: true };
+    }
     if (pending) return deny('pending');
     if (reason) { if (!(await recover())) return deny(reason); }
     if (clock.observe()) { close('clock_tamper'); return deny('clock_tamper'); }
@@ -659,14 +822,268 @@ export function createGate({ pluginId, dataDir, poolTarget = 500, lowWater = 50,
     if (pool.length < lowWater) refill().catch(() => {});
     return { allowed: true };
   };
-  // 软门禁：不消耗票。⚠️ 判断"能不能用"必须同时看 ready && pool>0（线上版 ready 在 pool=0 时仍为 true）
+  /* ============ v1.2c：全量插件清单扫描 + 上报 ============
+     目标：管理台能看到「这台机器上装了什么」，**包括用户自己 git clone 进来的无授权插件**。
+     手段：读 DSH profile 的 package.json（dependencies + dsh.profile.bundles），
+          这是 DSH 插件「装载」的唯一权威来源 —— 只装目录不登记 bundles 是不会加载的，
+          所以只扫 node_modules 会把装了没启用的垃圾也算进来，只扫 bundles 又漏掉依赖。
+     拿不到的：无授权插件的「使用次数」。它们没有门禁代码，没有调用计数。
+        这里退化为 usages_known=0（管理台显示「-」而不是伪造的 0）。 */
+  /* 只认「客户实际使用的 Web profile」，排除历史残留与其它运行模式。
+     ★ v1.2c 修正：8.6 宿主的 ~/.dsh/profiles/ 下实际有 13 个目录：
+       - web                      ← 生产，客户在用的
+       - headless / hlppt         ← 无头批处理模式，客户从 web 访问不会加载
+       - web.bak-team-20260916    ← 备份
+       - web.meeting034-* / web.ui033-* ← 历史测试与隔离残留
+     全扫进来会把「这台机器装了什么」严重虚高。判据：
+       1) 名字必须是 web / default（或 DSH_PROFILE 指定的那个）；
+       2) 排除 headless / hlppt / cli / server 这类非 Web 运行模式；
+       3) 排除含点号、bak/old/fail/quarant/stage 的历史残留。 */
+  const NON_WEB_PROFILE = /^(headless|hlppt|cli|server|batch|worker|daemon)$/i;
+  function isLiveProfileName(name) {
+    if (!name) return false;
+    const n = String(name);
+    if (n === 'web' || n === 'default') return true;
+    if (NON_WEB_PROFILE.test(n)) return false;      // 无头/CLI 模式，不是客户界面
+    if (/[.]/.test(n)) return false;                // web.xxx 之类历史残留
+    if (/bak|old|fail|quarant|stage|test|copy|tmp/i.test(n)) return false;
+    return true;
+  }
+  function findProfiles() {
+    const out = [];
+    const home = process.env.DSH_HOME || path.join(os.homedir(), '.dsh');
+    // 当前进程正跑哪个 profile：DSH_PROFILE 优先；否则以 cwd/execPath 是否落在某 profile 下反推
+    const cur = String(process.env.DSH_PROFILE || '').trim();
+    const push = (p, name) => {
+      try {
+        if (!p || !fs.existsSync(p) || out.includes(p)) return;
+        if (cur) { if (name === cur) out.push(p); return; }
+        if (isLiveProfileName(name)) out.push(p);
+      } catch {}
+    };
+    const cands = [
+      path.join(home, 'profiles'),
+      // 多用户部署：每账号一套 profile
+      path.join(home, 'multi-user', 'users'),
+    ];
+    for (const base of cands) {
+      try {
+        if (!fs.existsSync(base)) continue;
+        if (base.endsWith('profiles')) {
+          for (const d of fs.readdirSync(base)) push(path.join(base, d), d);
+        } else {
+          // users/<u>/home/profiles/<profile>
+          for (const u of fs.readdirSync(base)) {
+            const pd = path.join(base, u, 'home', 'profiles');
+            if (fs.existsSync(pd)) for (const d of fs.readdirSync(pd)) push(path.join(pd, d), d);
+          }
+        }
+      } catch {}
+    }
+    return out;
+  }
+
+  /* 判定一个包是否「走授权门禁」。
+     ★ v1.2c 修正：原来只看 `@local/` 前缀，把 dsh-meetai / dsh-raganything-kb /
+       @liustack/modsearch / dsh-memory-evolve 这些**确实带了门禁**的包全判成 0；
+       而 @local/dsh-workbench 的门禁是**内联在 minified index.js** 里的（没有独立文件），
+       光看 @local/ 前缀又把它判成 1 —— 两个方向都错。
+     现在的判据（任一命中即算有门禁）：
+       a) 包里存在 license-gate.* / license-http.* 文件（含 lib//dsh//scripts//licenses/ 子目录）
+       b) index.js（含 minified）里出现门禁特有字符串。minified 后变量名被压缩，
+          但**错误码字面量**保留，用它们判定最可靠。
+     这个判定只影响管理台标签，不参与任何校验；读文件失败按无授权处理。 */
+  const GATE_FILES = [
+    'license-gate.mjs', 'license-http.mjs', 'license-gate.js', 'license-http.js',
+    'lib/license-gate.mjs', 'lib/license-http.mjs',
+    'dsh/license-gate.mjs', 'dsh/license-http.mjs',
+    'scripts/license-gate.mjs', 'scripts/license-http.mjs',
+    'licenses/license-gate.mjs', 'licenses/license-http.mjs',
+    'src/license-gate.mjs', 'src/license-http.mjs',
+    'src/lib/license-gate.mjs', 'src/lib/license-http.mjs',
+  ];
+  // minified 后仍保留的授权特有字面量（必须够特异，否则会把普通包误判成有门禁）
+  const GATE_MARKERS = ['offline_no_license', 'FEATURE_UNAVAILABLE', 'LICENSE_REQUIRED',
+                        'dsh-device/v1', 'dsh-pack/v1', 'DSH-LICPACK', 'no_ticket'];
+  function pkgHasGate(dir, name) {
+    try {
+      const base = path.join(dir, 'node_modules', name);
+      for (const f of GATE_FILES) {
+        if (fs.existsSync(path.join(base, f))) return true;
+      }
+      // 兜底扫一层子目录里的 license-*（版本间目录会变，如 meetai 0.3.15 用 licenses/）
+      try {
+        for (const sub of fs.readdirSync(base)) {
+          const sd = path.join(base, sub);
+          let isDir = false;
+          try { isDir = fs.statSync(sd).isDirectory(); } catch {}
+          if (!isDir) continue;
+          if (fs.existsSync(path.join(sd, 'license-gate.mjs'))) return true;
+          if (fs.existsSync(path.join(sd, 'license-http.mjs'))) return true;
+        }
+      } catch {}
+      // minified index.js 的特征字符串判定
+      for (const f of ['index.js', 'lib/index.js', 'dsh/index.js', 'dist/index.js']) {
+        const p = path.join(base, f);
+        if (!fs.existsSync(p)) continue;
+        let s = '';
+        try { s = fs.readFileSync(p, 'utf-8'); } catch { continue; }
+        for (const m of GATE_MARKERS) {
+          if (s.includes(m)) return true;
+        }
+      }
+    } catch {}
+    return false;
+  }
+
+  function scanPlugins() {
+    const list = [];
+    const seen = new Set();
+    for (const dir of findProfiles()) {
+      let pkg;
+      try { pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8')); } catch { continue; }
+      const deps = pkg.dependencies || {};
+      const bundles = (pkg.dsh && pkg.dsh.profile && Array.isArray(pkg.dsh.profile.bundles)) ? pkg.dsh.profile.bundles : [];
+      // 该 profile 对应的账号名：.../multi-user/users/<u>/home/profiles/<p>
+      let account = '';
+      const mm = dir.replace(/\\/g, '/').match(/multi-user\/users\/([^/]+)\//);
+      if (mm) account = mm[1];
+      for (const name of bundles) {
+        const key = account + '|' + name;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        let version = '';
+        try {
+          const p = path.join(dir, 'node_modules', name, 'package.json');
+          if (fs.existsSync(p)) version = String(JSON.parse(fs.readFileSync(p, 'utf-8')).version || '');
+        } catch {}
+        const hasGate = pkgHasGate(dir, name);
+        list.push({
+          account,
+          plugin_id: name,
+          version,
+          enabled: 1,
+          // 是否有门禁代码（= 有授权、能上报用量）。实测包里有没有 license-gate.mjs。
+          has_license: hasGate ? 1 : 0,
+          source: name.startsWith('@local/') ? 'bundle' : (deps[name] ? 'bundle' : 'manual'),
+          // 有门禁的插件能把用量报上来；自装的第三方插件拿不到计数，标记「未知」让管理台显示「-」
+          usages_known: hasGate ? 1 : 0,
+          usages: 0,
+        });
+      }
+    }
+    return list;
+  }
+
+  // 上报清单（节流：同一进程 10 分钟最多一次；服务端未开通该端点时静默失败，不影响使用）
+  let lastInvAt = 0, invRunning = null;
+  async function reportInventory(force) {
+    if (!key) return false;
+    if (!force && Date.now() - lastInvAt < 600_000) return false;
+    if (invRunning) return invRunning;
+    lastInvAt = Date.now();
+    invRunning = (async () => {
+      try {
+        const plugins = scanPlugins();
+        /* ★ v1.2c：必须按账号分组分别上报。
+           原来一律 `account: ''`，而服务端主键是 (client_id, account, plugin_id) ——
+           宿主进程一次能扫到全部 6 个账号的插件，全塞进 account='' 会互相覆盖，
+           管理台看到的「某台机器装了哪些插件」就只剩最后一个账号的。
+           下面按 account 分组，每组一次 POST。 */
+        const groups = new Map();
+        for (const p of plugins) {
+          const a = String(p.account || '');
+          if (!groups.has(a)) groups.set(a, []);
+          groups.get(a).push(p);
+        }
+        // 本插件的用量以门禁自己统计的为准（无授权插件拿不到，保持 0 + known=0）
+        const mine = plugins.find(p => p.plugin_id === pluginId || p.plugin_id === '@local/' + pluginId);
+        if (mine) { mine.usages = usageCount; mine.usages_known = 1; }
+
+        const osUser = (() => { try { return os.userInfo().username; } catch { return ''; } })();
+        let okAny = false;
+        for (const [account, list] of groups) {
+          try {
+            const { data } = await post('/api/client/inventory', key, {
+              hwid: hw, account, ...devBody(),
+              hostname: os.hostname(), os_user: osUser,
+              agent_ver: AGENT_VER, plugins: list,
+            });
+            if (data && data.ok) okAny = true;
+          } catch {}
+        }
+        return okAny;
+      } catch { return false; } finally { invRunning = null; }
+    })();
+    return invRunning;
+  }
+  // 用量喂给「全量插件口径」：授权插件本就随 refresh 的上报，这里不重复计。
+  // 这里只做一件有用的事：请求路径上顺带触发一次清单上报（内部 10 分钟节流、await 不进阻塞路径）。
+  function reportUsageAsync() {
+    if (!key) return;
+    if (Date.now() - lastInvAt < 600_000) return;
+    Promise.resolve().then(() => reportInventory().catch(() => {})).catch(() => {});
+  }
+  gate.reportInventory = reportInventory;
+  gate.scanPlugins = scanPlugins;
+
+  // 软门禁：不消耗票。
   gate.state = async () => {
     await init();                                   // doInit 内部全 catch，不会抛
+    /* ★ v1.2c STATE-SYNC：state() 被调用时，若距上次成功同步超过 STATE_SYNC_MS，
+       主动拉一次 sync。原因：原来只有 60s 心跳会 sync，管理台点「禁止」后
+       客户端最长 60 秒才感知；而 license-http 的 guard 每 2 秒读一次 state()，
+       读到的全是旧状态 —— 表现为"点了禁止，界面照常能用"。
+       这里做 20 秒节流的同步（guard 2s 轮询 → 实际最多 20s 生效，且不打爆服务端）。
+       离线/服务端不可达时 sync 会失败，但内部已 catch，不影响放行（静默模式约定）。 */
+    try {
+      const lid0 = lic && lic.license_id;
+      const due = !lid0 || !lastStateSync || (Date.now() - lastStateSync >= STATE_SYNC_MS);
+      if (due && !stateSyncing) {
+        stateSyncing = true;
+        lastStateSync = Date.now();
+        try { await sync(); } catch {} finally { stateSyncing = false; }
+      }
+    } catch {}
+    /* ★ v1.2b REVOKE-COHERENCE：把「证被停用」提炼成 reason，让 state 自描述。
+       之前只把结论塞进 usable=false，reason 留空 —— 前端只看 silent 就放行了，
+       结果是「界面能开、功能全 403」，客户更懵。现在状态里明确带 revoked / not_active。 */
+    if (lic && lic.status && lic.status !== 'active' && !(reason && reasonKind === 'permanent')) {
+      reason = lic.status === 'disabled' ? 'revoked' : 'not_active';
+      reasonKind = 'permanent';
+    }
     if (reason && reasonKind !== 'permanent') { try { recover().catch(() => {}); } catch {} }
+    // 有效期信息（静默模式下不锁屏，但要能报给管理台）
+    let expInfo = { expired: false, daysLeft: null };
+    try {
+      if (lic && lic.expires_at) {
+        const exp = new Date(lic.expires_at).getTime();
+        if (Number.isFinite(exp)) {
+          expInfo.expired = clock.now() >= exp;
+          expInfo.daysLeft = Math.floor((exp - clock.now()) / 86400000);
+        }
+      }
+    } catch {}
+    /* 「被服务商主动停用」是静默模式下**唯一**该锁屏的情形。
+       判据同时看当前证与最近一次永久性关闭原因，两边任一命中都算。 */
+    const blockedNow = !!(reason && reasonKind === 'permanent' && SILENT_BLOCKERS.has(reason))
+      || !!(lic && lic.status && lic.status !== 'active');
     return {
       ready: !reason && !pending, pending,
-      // WB-TICKET-FREE: 旁路模式下「有证有效」即可用，不看票数
-      usable: !reason && !pending && (ticketFree || pool.length > 0),
+      /* ★ v1.2：静默模式恒为可用（吊销除外）。
+         前端**只**认这个字段决定要不要锁屏，所以这里必须是最权威的结论。
+         注意不能只看 pool —— 旧逻辑 `pool===0 → no_ticket` 是 v1.1 全量锁屏的主因之一。
+         过期**不**锁屏（这是产品决定：客户永远看不到激活界面），但通过 expired /
+         days_left 暴露给管理台做续费提醒 —— 管控靠“服务端吊销”，不靠“到期停机”。 */
+      usable: silent
+        ? !blockedNow                                   // 静默：只有“被停用”会不可用
+        : (!reason && !pending && (ticketFree || pool.length > 0)),
+      silent,
+      /* ★ v1.2b：silent=true 通常表示“永不允许锁屏”，但**被吊销时必须放行锁屏**，
+         否则客户看到的是「能打开、处处报错」而不是「已停用」。 */
+      lockable: !silent || blockedNow,
+      expired: expInfo.expired,
+      days_left: expInfo.daysLeft,
       plugin_id: pluginId, via: kindUsed, scope: lic ? (lic.plugin_id === '*' ? 'suite' : 'plugin') : null,
       license_id: lic ? lic.license_id : null, status: lic ? lic.status : null,
       expires_at: lic ? lic.expires_at : null, pool: pool.length, reason,
