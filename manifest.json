@@ -1,0 +1,35 @@
+{
+  "name": "dsh-memory-evolve",
+  "unit": "dsh-memory-evolve",
+  "version": "0.2.2",
+  "previousVersion": "0.2.1",
+  "title": "记忆演化",
+  "kind": "plugin",
+  "services": [],
+  "ports": [],
+  "pluginDir": "dsh-memory-evolve",
+  "hasVenv": false,
+  "hasNode": false,
+  "hasHarness": false,
+  "generatedAt": "2026-11-10T12:48:11+08:00",
+  "host": "lgsj",
+  "installScope": [
+    "host-profile",
+    "all-existing-accounts"
+  ],
+  "baseRepo": "imasonhk-spec/dsh",
+  "baseTag": "v0.2.0",
+  "fsEntries": [],
+  "aptProvides": [],
+  "runtimeFrom": [],
+  "pathRemap": [
+    {
+      "from": "/home/lgsj/.dsh",
+      "to": "@DSH_HOME@"
+    },
+    {
+      "from": "/home/lgsj",
+      "to": "@USER_HOME@"
+    }
+  ]
+}
