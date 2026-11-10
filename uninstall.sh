@@ -3,7 +3,7 @@
 set -euo pipefail
 
 PKG_NAME="dsh-memory-evolve"
-PKG_VERSION="0.2.0"
+PKG_VERSION="0.2.1"
 PLUGIN_DIR="dsh-memory-evolve"
 SERVICES=""
 

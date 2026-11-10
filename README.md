@@ -1,4 +1,4 @@
-# dsh-memory-evolve 0.2.0
+# dsh-memory-evolve 0.2.1
 
 记忆演化
 
@@ -20,8 +20,8 @@
 ## 安装
 
 ```bash
-tar -xzf dsh-memory-evolve-0.2.0.tar.gz
-cd dsh-memory-evolve-0.2.0
+tar -xzf dsh-memory-evolve-0.2.1.tar.gz
+cd dsh-memory-evolve-0.2.1
 sudo ./install.sh
 ```
 
